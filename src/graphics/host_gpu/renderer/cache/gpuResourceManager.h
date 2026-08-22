@@ -6,7 +6,6 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
-
 #include <cstdint>
 #include <shared_mutex>
 
@@ -28,6 +27,8 @@ public:
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
+	// Contiguous mapped bytes starting at vaddr, capped at max_size and tracker space.
+	[[nodiscard]] uint64_t MappedExtent(uint64_t vaddr, uint64_t max_size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();

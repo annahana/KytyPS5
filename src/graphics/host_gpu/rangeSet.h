@@ -2,7 +2,6 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RANGESET_H_
 
 #include "common/assert.h"
-
 #include <algorithm>
 #include <cstdint>
 #include <map>
@@ -57,6 +56,25 @@ public:
 		std::vector<Range> result;
 		ForEachIntersection(address, size, [&result](Range range) { result.push_back(range); });
 		return result;
+	}
+
+	// How many bytes from `address` fall inside a single tracked range, capped at `max_size`, or
+	// zero when the address is not tracked at all. Add coalesces overlapping and adjacent ranges, so
+	// one entry spans an entire contiguous run and a nonzero result really is contiguous.
+	[[nodiscard]] uint64_t ContiguousExtent(uint64_t address, uint64_t max_size) const {
+		if (address == 0 || max_size == 0) {
+			return 0;
+		}
+		auto it = m_ranges.upper_bound(address);
+		if (it == m_ranges.begin()) {
+			return 0;
+		}
+		--it;
+		// Entries are half-open [first, second).
+		if (address < it->first || address >= it->second) {
+			return 0;
+		}
+		return std::min(it->second - address, max_size);
 	}
 
 	[[nodiscard]] bool Contains(uint64_t address, uint64_t size) const {

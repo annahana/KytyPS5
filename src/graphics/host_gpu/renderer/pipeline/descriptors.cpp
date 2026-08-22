@@ -1,5 +1,4 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
-
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/file.h"
@@ -27,8 +26,6 @@
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
-#include "kernel/memory.h"
-
 #include <algorithm>
 #include <atomic>
 #include <fmt/format.h>
@@ -79,28 +76,6 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 	       type == Prospero::ImageType::kColor2DMsaaArray;
 }
 
-static BufferRange StorageBufferRange(RenderContext& context,
-                                      const ShaderBufferResource& descriptor) {
-	const auto address = descriptor.Base48();
-	const auto stride  = descriptor.Stride();
-	const auto records = descriptor.NumRecords();
-	if (stride != 0 && records > UINT64_MAX / stride) {
-		EXIT("storage buffer descriptor footprint overflow\n");
-	}
-	const auto requested_size = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
-	if (address == 0 || requested_size == 0) {
-		return {};
-	}
-	const auto size       = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
-	const auto& graphics  = context.GetGraphics();
-	const auto  alignment = graphics.StorageMinAlignment();
-	if (alignment == 0 || size == 0 ||
-	    size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
-		EXIT("storage buffer range or device alignment is unsupported\n");
-	}
-	return {.address = address, .size = size};
-}
-
 static BufferRange AddressBufferRange(
     RenderContext& context, const ShaderRecompiler::IR::AddressResource& resource,
     const ShaderRecompiler::IR::ResourceSnapshot::Address& address) {
@@ -135,28 +110,95 @@ static BufferView NativeStorageBuffer(RenderContext& context, CommandBuffer& com
 	BufferView result;
 	buffer_offset = 0;
 
-	const auto range = StorageBufferRange(context, descriptor);
-	if (range.address == 0) {
+	const auto address = descriptor.Base48();
+	const auto stride  = descriptor.Stride();
+	const auto records = descriptor.NumRecords();
+	if (stride != 0 && records > UINT64_MAX / stride) {
+		EXIT("storage buffer descriptor footprint overflow\n");
+	}
+	const auto nominal = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
+	// An indexed read-only fetch is exempt from the empty-footprint shortcut. num_records is the field
+	// the extension below exists because it under-reports, and zero is that same under-reporting at
+	// its limit: taking it at face value binds nothing at all, so every index reads zero and the whole
+	// mesh collapses rather than part of it. A base that genuinely maps nothing still lands on the
+	// null buffer a few lines down, once the mapping has been asked rather than the descriptor.
+	const bool indexed_fetch = resource.read && !resource.written && stride != 0;
+	if (address == 0 || (nominal == 0 && !indexed_fetch)) {
 		BindNullStorageBuffer(context, result);
 		return result;
 	}
-	const auto  address   = range.address;
-	const auto  size      = range.size;
 	const auto& graphics  = context.GetGraphics();
 	const auto  alignment = graphics.StorageMinAlignment();
+	const auto  max_range =
+	    static_cast<uint64_t>(graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange);
+	if (alignment == 0) {
+		EXIT("storage buffer device alignment is unsupported\n");
+	}
+
+	// A GNM descriptor's num_records is routinely over-provisioned - commonly close to UINT32_MAX -
+	// because the shader bounds-checks its own accesses. The nominal footprint is therefore not a
+	// claim that any of it is resident, and binding it whole asks the buffer cache to stage, track
+	// and map memory the guest never mapped: that faults inside the staging copy or fails the memory
+	// tracker's range validation, depending on where the descriptor happens to point.
+	//
+	// Bind the contiguous mapped extent instead. The extent comes from the ranges the guest mapped for
+	// GPU access rather than from host commit state: that is the question actually being asked, it
+	// costs a map probe instead of a kernel transition on a path that runs for every buffer of every
+	// draw, and it does not mistake a GPU-owned page for an absent one.
+	//
+	// num_records is likewise not a reliable *lower* bound on what a shader reads. A skinned mesh
+	// fetches its bone matrices through one formatted descriptor indexed by bone number, and the
+	// descriptor it is given routinely describes fewer records than the mesh indexes - so binding
+	// exactly stride * num_records leaves every bone past the end reading zero under robust access.
+	// Zero matrices collapse their vertices onto the origin while the rest stay correctly posed,
+	// which is a mesh torn between two positions rather than one that is simply missing.
+	//
+	// So such a descriptor is given the mapped extent even when its record footprint is smaller. This
+	// can only grow the binding, never shrink it, and it stays inside memory the guest mapped for the
+	// GPU.
+	//
+	// Kept as narrow as the symptom allows, on two axes. Only a read-only descriptor with a stride
+	// qualifies - a stride is what makes a fetch indexed by record, which is the shape the bound bites
+	// on - so raw byte buffers and every written buffer keep the footprint they ask for. Whether the
+	// fetch is format-converted makes no difference to the bound and is deliberately not part of the
+	// test. And the growth is capped well below the mapping, because ObtainBuffer does not merely bind
+	// this range: it tracks it, which write-protects the guest pages underneath. Reaching further than
+	// the resource needs puts unrelated game data behind that protection, which is a good deal worse
+	// than a short binding. Sixty-four kilobytes is a thousand-odd matrices - far past any real mesh -
+	// while staying inside a handful of the buffer cache's own pages.
+	//
+	// Compute is deliberately included. Skinning does not only happen in the draw path - a skin-cache
+	// pass reads the same bone matrices in compute and writes the posed vertices out - so excluding
+	// it puts that pass straight back on the short binding and the tear returns.
+	constexpr uint64_t IndexedFetchCap = 64ull * 1024ull;
+	const auto         read_extent     = std::min(max_range, IndexedFetchCap);
+	const auto requested =
+	    indexed_fetch && nominal < read_extent ? read_extent : std::min(nominal, max_range);
+	const auto size = context.GetGpuResources().MappedExtent(address, requested);
+
+	// A base that maps nothing binds the null buffer rather than faulting; reads then return zero,
+	// which is the same answer robust access gives past the end of a short binding.
+	if (size == 0) {
+		BindNullStorageBuffer(context, result);
+		return result;
+	}
+
 	auto binding = context.GetBufferCache().ObtainBuffer(
 	    command_buffer, address, size, resource.written, resource.read, resource.formatted);
 	const auto aligned_offset = binding.offset - binding.offset % alignment;
 	const auto adjustment     = binding.offset - aligned_offset;
-	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
-	if (adjustment % sizeof(uint32_t) != 0 || adjustment >= 256 || size > max_range - adjustment) {
+	if (adjustment % sizeof(uint32_t) != 0 || adjustment >= 256) {
 		EXIT("storage buffer offset adjustment is unsupported\n");
 	}
-	buffer_offset = static_cast<uint32_t>(adjustment);
-	result.owner  = std::move(binding.owner);
-	result.buffer = binding.buffer;
-	result.offset = aligned_offset;
-	result.range  = static_cast<vk::DeviceSize>(size + adjustment);
+	// Aligning the offset down puts `adjustment` bytes in front of the binding, so the described
+	// range has to leave room for them inside the device limit. Trimming the tail is safe for the
+	// same reason the clamp above is.
+	const auto bound_size = std::min(size, max_range - adjustment);
+	buffer_offset         = static_cast<uint32_t>(adjustment);
+	result.owner          = std::move(binding.owner);
+	result.buffer         = binding.buffer;
+	result.offset         = aligned_offset;
+	result.range          = static_cast<vk::DeviceSize>(bound_size + adjustment);
 	return result;
 }
 

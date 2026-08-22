@@ -1,8 +1,8 @@
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
-
 #include "common/assert.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include <algorithm>
 namespace Libs::Graphics {
 
 GpuResourceManager::GpuResourceManager(GraphicContext& graphics, CommandScheduler& scheduler)
@@ -41,6 +41,15 @@ bool GpuResourceManager::IsMapped(uint64_t vaddr, uint64_t size) const noexcept 
 	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	return m_mapped_ranges.Contains(vaddr, size);
+}
+
+uint64_t GpuResourceManager::MappedExtent(uint64_t vaddr, uint64_t max_size) const noexcept {
+	if (vaddr == 0 || max_size == 0 || vaddr >= TRACKER_ADDRESS_SIZE) {
+		return 0;
+	}
+	const auto       limit = std::min(max_size, TRACKER_ADDRESS_SIZE - vaddr);
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	return m_mapped_ranges.ContiguousExtent(vaddr, limit);
 }
 
 void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size) {
