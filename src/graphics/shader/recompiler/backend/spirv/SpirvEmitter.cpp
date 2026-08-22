@@ -227,9 +227,8 @@ bool AnalyzeProgramRequirements(IR::Program& program, std::string* error) {
 						return Fail(error, "buffer operation has invalid resource metadata");
 					}
 					if ((program.info.buffers[memory.resource].packed_stride & (1u << 20u)) != 0u) {
-						if (program.stage != ShaderType::Compute) {
-							return Fail(error, "buffer ADD_TID is only valid for compute shaders");
-						}
+						// ADD_TID selects the current wave lane. This is also used by some
+						// vertex shaders, so request the subgroup lane input for every stage.
 						requirements.requires_exact_subgroup      = true;
 						requirements.subgroup_local_invocation_id = true;
 					}
