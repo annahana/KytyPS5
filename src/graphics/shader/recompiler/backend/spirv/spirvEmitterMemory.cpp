@@ -303,8 +303,10 @@ FormattedSource ResolveFormattedSource(ValueEmitContext& ctx, const IR::MemoryIn
 	if (selector == 0u) return {};
 	if (selector == 1u) return {FormattedSourceKind::One, 0};
 	if (selector < 4u) {
-		ExitDescriptorBindingFailure(ctx.state, IR::DescriptorBindingKind::Buffers, mem.resource,
-		                             "buffer descriptor has reserved dst_sel");
+		// Values 2 and 3 are reserved by the hardware encoding. Some games leave these
+		// selectors in otherwise usable descriptors. Treat them as constant zero instead
+		// of aborting SPIR-V emission; this matches the safest robust-access fallback.
+		return {};
 	}
 	const auto component = selector - 4u;
 	return component < info.component_count
