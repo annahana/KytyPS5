@@ -103,6 +103,30 @@ static BufferRange AddressBufferRange(
 	return {.address = address.binding_base, .size = size};
 }
 
+static BufferRange StorageBufferRange(
+    RenderContext& context, const ShaderBufferResource& descriptor,
+    const ShaderRecompiler::IR::BufferResource& resource) {
+	const auto address = descriptor.Base48();
+	const auto stride  = descriptor.Stride();
+	const auto records = descriptor.NumRecords();
+	if (stride != 0 && records > UINT64_MAX / stride) {
+		EXIT("storage buffer descriptor footprint overflow\n");
+	}
+	const auto nominal       = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
+	const bool indexed_fetch = resource.read && !resource.written && stride != 0;
+	if (address == 0 || (nominal == 0 && !indexed_fetch)) {
+		return {};
+	}
+	const auto max_range = static_cast<uint64_t>(
+	    context.GetGraphics().GetPhysicalDeviceProperties().limits.maxStorageBufferRange);
+	constexpr uint64_t IndexedFetchCap = 64ull * 1024ull;
+	const auto read_extent = std::min(max_range, IndexedFetchCap);
+	const auto requested =
+	    indexed_fetch && nominal < read_extent ? read_extent : std::min(nominal, max_range);
+	const auto size = context.GetGpuResources().MappedExtent(address, requested);
+	return {.address = address, .size = size};
+}
+
 static BufferView NativeStorageBuffer(RenderContext& context, CommandBuffer& command_buffer,
                                       const ShaderBufferResource&                 descriptor,
                                       const ShaderRecompiler::IR::BufferResource& resource,
@@ -240,7 +264,7 @@ static void CollectNativeBufferRanges(RenderContext& context,
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		ShaderBufferResource descriptor;
 		CopyNativeDescriptor(snapshot.buffers[i], descriptor.fields);
-		ranges.push_back(StorageBufferRange(context, descriptor));
+		ranges.push_back(StorageBufferRange(context, descriptor, program.info.buffers[i]));
 	}
 	for (uint32_t i = 0; i < program.info.addresses.size(); i++) {
 		ranges.push_back(
